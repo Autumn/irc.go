@@ -1,40 +1,117 @@
-package bot
+// TO-DO
+
+// write a core module, with necessary functionality like PING, CTCP, XDCC?
+// fix parse()
+// add buffering to the split/parse to handle the case where server sends incomplete messages
+// finalise interface
+
+package main
 
 import (
     "fmt"
     "net"
     "bytes"
     "regexp"
+    "time"
     "container/list"
 )
-
-type RegUser struct {
-    pass string
-    nick string
-    user string
-    host string
-    server string
-    real string
-}
-
-func NewRegUser(nick, user, host, server, real string) *RegUser {
-    return &RegUser{pass:"", nick:nick, user:user, host:host, server:server, real:real}
-}
 
 func NewMessageChan() chan *Message {
     return make(chan *Message)
 }
 
-func (r *RegUser) userString() string {
-    return r.user + " " + r.host+ " " + r.server+ " " + r.real
+type Bot struct {
+    nick string
+    pass string
+    user string
+    host string
+    serv string
+    real string
+
+    server string
+    port string
+    
+    ssl bool
+
+    plugins *list.List
+    chans *list.List
+    
+    send chan *SendMessage
+    recv chan *ServerResponse
+    bot chan *Message
+    con net.Conn
 }
 
-func (r *RegUser) nickString() string {
-    return r.nick
+func New() *Bot {
+    return &Bot{ nick:"oneechan",
+                 pass:"",
+                 user:"kurugaya",
+                 host:"0",
+                 serv:"*",
+                 real:"umu umu",
+                 server:"",
+                 port:"6667",
+                 ssl:false,
+                 plugins:list.New(),
+                 chans:list.New(),
+                 send:make(chan *SendMessage),
+                 recv:make(chan *ServerResponse),
+                 bot:make(chan *Message),
+                 con:nil           }
 }
 
-// TO DO
-// rename structs 
+func (b *Bot) Nick(nick string) *Bot {
+    b.nick = nick
+    return b
+}
+
+func (b *Bot) Pass(pass string) *Bot {
+    b.pass = pass
+    return b
+}
+
+func (b *Bot) User(user string) *Bot {
+    b.user = user
+    return b
+}
+
+func (b *Bot) Host(host string) *Bot {
+    b.host = host
+    return b
+}
+
+func (b *Bot) Serv(serv string) *Bot {
+    b.serv = serv
+    return b
+}
+
+func (b *Bot) Real(real string) *Bot {
+    b.real = real
+    return b
+}
+
+func (b *Bot) Server(server string) *Bot {
+    b.server = server
+    return b
+}
+
+func (b *Bot) Port(port string) *Bot {
+    b.port = port
+    return b
+}
+
+func (b *Bot) Ssl(ssl bool) *Bot {
+    b.ssl = ssl
+    return b
+}
+
+func (b *Bot) userString() string {
+    return b.user + " " + b.host + " " + b.serv + " " + b.real
+}
+
+func (b *Bot) nickString() string {
+    return b.nick
+}
 
 type Message struct {
     Servername string
@@ -53,11 +130,11 @@ type SendMessage struct {
 }
 
 func (b *Bot) register() {
-    if len(b.user.pass) != 0 {
-        b.Send("PASS " + b.user.pass)
+    if len(b.pass) != 0 {
+        b.Send("PASS " + b.pass)
     }
-    b.Send("NICK " + b.user.nickString())
-    b.Send("USER " + b.user.userString())
+    b.Send("NICK " + b.nickString())
+    b.Send("USER " + b.userString())
 }
 
 type ServerResponse struct {
@@ -66,86 +143,77 @@ type ServerResponse struct {
     msg []byte
 }
 
-type Bot struct {
-    user *RegUser
-    server string
-    f *list.List
-    g *list.List
-    send chan *SendMessage
-    recv chan *ServerResponse
-    bot chan *Message
-    con net.Conn
+func (b *Bot) Add(ch chan *Message, f func()) {
+   b.chans.PushBack(ch)
+   b.plugins.PushBack(f)
 }
 
-func NewBot(user *RegUser, server string) *Bot {
-    send := make(chan *SendMessage);
-    recv := make(chan *ServerResponse)
-    bot := make(chan *Message)
-    return &Bot{user, server, list.New(), list.New(), send, recv, bot, nil}
+func (b *Bot) Send(s string) {
+   b.con.Write(bytes.NewBufferString(s + "\r\n").Bytes())
 }
 
-/* TO DO
-   - connect active and connect passive
-    - active will remain in the loop and print to stdout
-    - passive will run in background, allow user to handle output by listening to channels
-*/
-
-func (bot *Bot) Add(ch chan *Message, f func()) {
-    bot.f.PushBack(ch)
-    bot.g.PushBack(f)
-}
-
-func (bot *Bot) Send(s string) {
-    bot.con.Write(bytes.NewBufferString(s + "\r\n").Bytes())
-}
-
-func (bot *Bot) Connect() {
-    con, err := net.Dial("tcp", bot.server)
+func (b *Bot) Connect() {
+    con, err := net.Dial("tcp",b.server + ":" + b.port)
     if err == nil {
-        bot.con = con
+       b.con = con
+
+        // goroutine for sending messages to server
 
         go func() {
             for {
-                msg := <- bot.send
-                bot.Send(msg.command + " " + msg.target + " :" + msg.message)
+                msg := <- b.send
+               b.Send(msg.command + " " + msg.target + " :" + msg.message)
             }
         }()
+        
+        // goroutine to read messages from server and send it to the received channel
 
         go func() {
             for {
-                var b [512]byte
-                nbytes, ok := bot.con.Read(b[0:512])
-                bot.recv <- &ServerResponse{nBytes:nbytes, err: ok, msg: b[0:512]}
+                var resp [512]byte
+                nbytes, ok := b.con.Read(resp[0:512])
+               b.recv <- &ServerResponse{nBytes:nbytes, err: ok, msg: resp[0:512]}
             }
         }()
 
-        for e := bot.g.Front(); e != nil; e = e.Next() {
+        // initiate all the module goroutines
+
+        for e := b.plugins.Front(); e != nil; e = e.Next() {
             f := e.Value.(func())
             go f()
         }
 
+        // goroutine to send messages to each module, when received from server
+
         go func() {
             for {
-                msg := <- bot.bot
-                // send message to a list of channels, which implement bot features
-                for e := bot.f.Front(); e != nil; e = e.Next() {
+                msg := <- b.bot
+                // send message to a list of channels, which implement features
+                for e := b.chans.Front(); e != nil; e = e.Next() {
                     ch := e.Value.(chan *Message)
                     ch <- msg
                 }
             }
         }()
 
-        bot.register()
+       b.register()
  
+        // - read server response from reader goroutine
+        // - split the message into correctly delimited irc messages
+
+        // TO DO: handle the case where the server sends an incomplete message
+        //        required to buffer incomplete message and prepend it to the next message
+
+        // - send each split string into the goroutine
 
         for {
-            resp := <- bot.recv 
+            resp := <- b.recv 
             _, err, msg := resp.nBytes, resp.err, resp.msg
             if err == nil {
                 msgs := bytes.Split(msg[0:512], bytes.NewBufferString("\r\n").Bytes())
                 for _, val := range msgs {
                     // match and switch on the message
-                    bot.bot <- parse(val)
+                    b.bot <- parse(val)
                 }
             } else {
                 fmt.Printf("error: connection terminated by server.\n")
@@ -160,7 +228,12 @@ func (bot *Bot) Connect() {
 
 
 // TO DO
+
 // rewrite using the new regexp library
+// better: rewrite emulating the irc EBNF
+
+// need to handle case where server sends an incomplete message, 
+// buffering the message to send to the next parse round
 
 func parse(b []byte) *Message {
     var servername, nick, user, host string
@@ -209,67 +282,45 @@ func parse(b []byte) *Message {
         Message: msg,
     }
 }
-/*
+
 func main() {
-    reg := &RegUser{
-        nick: "oneechan",
-        user: "g",
-        host: "0", 
-        server: "*", 
-        real:"~oneechan~",
+    b := New().Server("irc.rizon.net")
+
+    ch2 := NewMessageChan()
+
+    perform := func() {
+        for {
+            msg := <- ch2
+            if msg.Command == "001" {
+//                b.Send("PRIVMSG NICKSERV :IDENTIFY *")
+// send password here
+                time.Sleep(time.Second)
+                b.Send("JOIN #oneechan")
+            }
+        }
     }
 
-    bot := NewBot(reg, "irc.pantsuland.net:6667")
-    ch := make(chan *Message)
+    b.Add(ch2, perform)
 
-    // join channels
-    f :=  func() {
+    hc := NewMessageChan()
+    ping := func() {
+        for {
+            msg := <- hc
+            if msg.Command == "PING" {
+                b.Send("PONG " + msg.Hostname)
+            }
+        }
+    }
+    b.Add(hc, ping)
+
+    ch := NewMessageChan()
+    printer := func() {
         for {
             msg := <- ch
-            if msg.command == "376" {
-                bot.Send("JOIN #oneechan")
-            }
+            fmt.Println(msg.Servername + " " + msg.Username + " " + msg.Hostname + " " + msg.Command + " " + msg.Target + " " + msg.Message)
         }
     }
 
-    bot.Add(ch, f)
-    ch1 := make(chan *Message)
-    bot.Add(ch1, func() { 
-        for {
-            msg := <- ch1
-            ss := strings.SplitN(msg.message, " ", 2)
-            if len(ss) == 2 {
-                if ss[0] == ".mal" {
-                    resp, err := http.Get("http://mal-api.com/anime/search?q=" + url.QueryEscape(ss[1]))
-                    if err == nil {
-                        body, _ := ioutil.ReadAll(resp.Body)
-                        fmt.Println(bytes.NewBuffer(body).String())
-                        var f interface{}
-                        _ = json.Unmarshal(body, &f)
-                        m := f.([]interface{})
-                        for k, v := range m {
-                             switch vv := v.(type) {
-                                 case string:
-                                     fmt.Println(k, "is string", vv)
-                                 case int:
-                                     fmt.Println(k, "is int", vv)
-                                 case []interface{}:
-                                     fmt.Println(k, "is an array:")
-                                 for i, u := range vv {
-                                     fmt.Println(i, u)
-                                 }
-                                 default:
-                                     fmt.Println(k, "is of a type I don't know how to handle")
-                             }
-                            
-                    } else {
-                        fmt.Println("error occured")
-                    }
-                    resp.Body.Close()
-                }
-            }
-        }
-    })
-    bot.Connect()
+    b.Add(ch, printer)
+    b.Connect()
 }
-*/
